@@ -94,12 +94,17 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
                 generation.message.additional_kwargs["reasoning_content"] = reasoning
         return chat_result
 
+    # DeepSeek thinking models that don't support tool_choice/function-calling
+    _THINKING_MODEL_PREFIXES = ("deepseek-reasoner", "deepseek-v4", "deepseek-r1")
+
     def with_structured_output(self, schema, *, method=None, **kwargs):
-        if self.model_name == "deepseek-reasoner":
+        if self.model_name and any(
+            self.model_name.startswith(prefix) for prefix in self._THINKING_MODEL_PREFIXES
+        ):
             raise NotImplementedError(
-                "deepseek-reasoner does not support tool_choice; structured "
-                "output is unavailable. Agent factories fall back to "
-                "free-text generation automatically."
+                f"{self.model_name} (thinking mode) does not support "
+                "tool_choice; structured output is unavailable. "
+                "Agent factories fall back to free-text generation automatically."
             )
         return super().with_structured_output(schema, method=method, **kwargs)
 
@@ -107,6 +112,7 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "reasoning_effort",
     "api_key", "callbacks", "http_client", "http_async_client",
+    "thinking",
 )
 
 # Provider base URLs and API key env vars
