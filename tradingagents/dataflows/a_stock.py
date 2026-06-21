@@ -275,25 +275,58 @@ def _eastmoney_datacenter(
 
 
 def _ths_eps_forecast(code: str) -> pd.DataFrame:
-    """Fetch consensus EPS forecast from 同花顺 (direct HTTP).
+    """Fetch consensus EPS forecast from 同花顺 (direct HTTP, fast-fail).
 
-    Returns DataFrame with columns roughly: 年度, 预测机构数, 最小值, 均值, 最大值.
+    Note: 同花顺 basic.10jqka.com.cn pages are JS-rendered.
+    EPS data is embedded in a JS var ``yjycData`` inside the HTML source.
+    We extract it via regex rather than relying on pd.read_html (which needs
+    proper <table> markup that the JS-rendered page doesn't provide).
     """
     url = f"https://basic.10jqka.com.cn/new/{code}/worth.html"
     headers = {
         "User-Agent": _UA,
         "Referer": "https://basic.10jqka.com.cn/",
     }
-    r = _requests.get(url, headers=headers, timeout=15)
+    r = _requests.get(url, headers=headers, timeout=5)
     r.encoding = "gbk"
-    dfs = pd.read_html(r.text)
-    # Find the table containing EPS data
-    for df in dfs:
-        cols = [str(c) for c in df.columns]
-        if any("每股收益" in c or "均值" in c for c in cols):
-            return df
-    # Fallback: return first table if exists
-    return dfs[0] if dfs else pd.DataFrame()
+    html = r.text
+
+    # Try to extract the JS-embedded EPS data array first
+    # Format: <div id="yjycData" class="none">[["2019","32.80","412.06","SJ"],...]</div>
+    import re as _re
+    m = _re.search(
+        r'<div[^>]+id="yjycData"[^>]*>\s*(\[\[.*?\]\])\s*</div>',
+        html, _re.DOTALL,
+    )
+    if m:
+        try:
+            raw = m.group(1)
+            rows = _json.loads(raw)
+            # Columns: year, EPS, net_profit, type(SJ=actual, YC=forecast)
+            data_rows = []
+            for item in rows:
+                if len(item) >= 4:
+                    data_rows.append({
+                        "年度": item[0],
+                        "每股收益": float(item[1]) if item[1] else 0,
+                        "净利润(亿)": float(item[2]) if item[2] else 0,
+                        "类型": "预测" if item[3] == "YC" else "实际",
+                    })
+            if data_rows:
+                return pd.DataFrame(data_rows)
+        except (ValueError, _json.JSONDecodeError, IndexError):
+            pass
+
+    # Fallback: try pd.read_html for any actual tables on the page
+    try:
+        dfs = pd.read_html(html)
+        for df in dfs:
+            cols = [str(c) for c in df.columns]
+            if any("每股收益" in c or "均值" in c for c in cols):
+                return df
+        return dfs[0] if dfs else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +674,9 @@ def get_fundamentals(
         except Exception as e:
             logger.warning("mootdx finance failed for %s: %s", code, e)
 
-        # --- Eastmoney push2: basic stock info (direct HTTP) ---
+        # --- Eastmoney push2: basic stock info (3s fast-fail, skip rate limiter) ---
+        # push2.eastmoney.com has been flaky since 2026-06; use direct request
+        # with short timeout to avoid cascading delays in multi-agent pipelines.
         try:
             market_code = 1 if code.startswith("6") else 0
             _info_url = "https://push2.eastmoney.com/api/qt/stock/get"
@@ -651,7 +686,11 @@ def get_fundamentals(
                 "fields": "f57,f58,f84,f85,f127,f116,f117,f189,f43",
                 "secid": f"{market_code}.{code}",
             }
-            r = _em_get(_info_url, params=_info_params, timeout=10)
+            r = _requests.get(
+                _info_url, params=_info_params,
+                headers={"User-Agent": _UA},
+                timeout=3,
+            )
             d = r.json().get("data", {})
             if d:
                 if d.get("f127"):
@@ -666,8 +705,8 @@ def get_fundamentals(
                     lines.append(f"流通市值: {d['f117']}")
                 if d.get("f189"):
                     lines.append(f"上市日期: {d['f189']}")
-        except Exception as e:
-            logger.warning("eastmoney push2 stock info failed for %s: %s", code, e)
+        except Exception:
+            pass  # fast-fail: push2 is known-unstable, silence to avoid log spam
 
         # --- 同花顺 direct HTTP: consensus EPS forecast ---
         try:
@@ -791,7 +830,18 @@ def _get_financial_report_sina(
     d = r.json()
 
     result = d.get("result", {}).get("data", {})
+    # API format changed ~2026: data may wrap reports in "report_list" instead of
+    # exposing source_type ("lrb"/"fzb"/"llb") as a direct key.
     items = result.get(source_type, [])
+    if (not isinstance(items, list) or not items) and isinstance(result, dict):
+        # Try new format: {"report_list": [...]} where each item has "report_type"
+        report_list = result.get("report_list", [])
+        items = [
+            r for r in report_list
+            if isinstance(r, dict) and source_type in str(r.get("report_type", ""))
+        ]
+        if not items:
+            items = report_list  # fallback: return all reports
     if not isinstance(items, list) or not items:
         return pd.DataFrame()
 
@@ -1076,34 +1126,10 @@ def get_global_news(
 
     all_news: list[dict] = []
 
-    # Source 1: CLS wire (财联社快讯) — direct HTTP
-    try:
-        cls_url = "https://www.cls.cn/nodeapi/telegraphList"
-        cls_params = {"rn": str(limit), "page": "1"}
-        cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
-        r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
-        d_cls = r_cls.json()
-        for item in d_cls.get("data", {}).get("roll_data", []):
-            title = item.get("title", "") or item.get("brief", "")
-            content = item.get("content", "") or item.get("brief", "")
-            ctime = item.get("ctime", "")
-            # ctime is unix timestamp
-            pub_time = ""
-            if ctime:
-                try:
-                    pub_time = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M")
-                except (ValueError, TypeError, OSError):
-                    pub_time = str(ctime)
-            all_news.append({
-                "title": title,
-                "content": content,
-                "time": pub_time,
-                "source": "CLS Wire",
-            })
-    except Exception as e:
-        logger.warning("CLS news fetch failed: %s", e)
+    # Source 1 (was CLS): cls.cn/nodeapi/telegraphList returned 404 since 2026-06.
+    # Removed to avoid wasted requests. Eastmoney np-weblist is now the primary source.
 
-    # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
+    # Source: Eastmoney global (东财7x24资讯) — direct HTTP
     try:
         em_url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
         em_params = {
@@ -1579,13 +1605,14 @@ def get_concept_blocks(
             f'?stock=[{{"code":"{code}","market":"ab","type":"stock"}}]'
             "&finClientType=pc"
         )
-        r = requests.get(url, headers=_BAIDU_PAE_HEADERS, timeout=10)
+        r = requests.get(url, headers=_BAIDU_PAE_HEADERS, timeout=5)
         d = r.json()
 
         if str(d.get("ResultCode", -1)) != "0":
             return (
-                f"Baidu PAE error: ResultCode={d.get('ResultCode')} "
-                f"{d.get('ResultMsg', '')}"
+                f"# Concept & Sector Blocks for {code} (A-stock)\n"
+                f"# Source: 百度股市通 (unavailable: code={d.get('ResultCode')})\n"
+                f"# 概念板块数据暂不可用，请使用 wudao MCP concept_stocks 或 mx-data 查询\n"
             )
 
         result = d.get("Result", {})
@@ -1654,14 +1681,18 @@ def get_fund_flow(
     ]
 
     try:
-        # Realtime minute-level fund flow
+        # Realtime minute-level fund flow (fast-fail: push2 unstable, 3s timeout)
         url_rt = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
         params_rt = {
             "secid": secid, "klt": 1,
             "fields1": "f1,f2,f3,f7",
             "fields2": "f51,f52,f53,f54,f55,f56,f57",
         }
-        r = _em_get(url_rt, params=params_rt, timeout=10)
+        r = _requests.get(
+            url_rt, params=params_rt,
+            headers={"User-Agent": _UA},
+            timeout=3,
+        )
         d = r.json()
         klines = d.get("data", {}).get("klines", [])
 
@@ -1710,7 +1741,7 @@ def get_fund_flow(
                 "fields1": "f1,f2,f3,f7",
                 "fields2": "f51,f52,f53,f54,f55,f56,f57",
             }
-            rh = _em_get(url_hist, params=params_hist, timeout=10)
+            rh = _em_get(url_hist, params=params_hist, timeout=5)
             dh = rh.json()
             hist_klines = dh.get("data", {}).get("klines", [])
 

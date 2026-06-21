@@ -1,6 +1,6 @@
 # TradingAgents/graph/setup.py
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
@@ -8,6 +8,11 @@ from tradingagents.agents import *
 from tradingagents.agents.utils.agent_states import AgentState
 
 from .conditional_logic import ConditionalLogic
+from .parallel_analysts import (
+    create_parallel_analyst_node,
+    create_parallel_debate_node,
+    create_parallel_risk_node,
+)
 
 
 class GraphSetup:
@@ -44,169 +49,64 @@ class GraphSetup:
         if len(selected_analysts) == 0:
             raise ValueError("Trading Agents Graph Setup Error: no analysts selected!")
 
-        # Create analyst nodes
-        analyst_nodes = {}
-        delete_nodes = {}
-        tool_nodes = {}
-
-        if "market" in selected_analysts:
-            analyst_nodes["market"] = create_market_analyst(
-                self.quick_thinking_llm
-            )
-            delete_nodes["market"] = create_msg_delete()
-            tool_nodes["market"] = self.tool_nodes["market"]
-
-        if "social" in selected_analysts:
-            analyst_nodes["social"] = create_social_media_analyst(
-                self.quick_thinking_llm
-            )
-            delete_nodes["social"] = create_msg_delete()
-            tool_nodes["social"] = self.tool_nodes["social"]
-
-        if "news" in selected_analysts:
-            analyst_nodes["news"] = create_news_analyst(
-                self.quick_thinking_llm
-            )
-            delete_nodes["news"] = create_msg_delete()
-            tool_nodes["news"] = self.tool_nodes["news"]
-
-        if "fundamentals" in selected_analysts:
-            analyst_nodes["fundamentals"] = create_fundamentals_analyst(
-                self.quick_thinking_llm
-            )
-            delete_nodes["fundamentals"] = create_msg_delete()
-            tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
-
-        if "policy" in selected_analysts:
-            analyst_nodes["policy"] = create_policy_analyst(
-                self.quick_thinking_llm
-            )
-            delete_nodes["policy"] = create_msg_delete()
-            tool_nodes["policy"] = self.tool_nodes["policy"]
-
-        if "hot_money" in selected_analysts:
-            analyst_nodes["hot_money"] = create_hot_money_tracker(
-                self.quick_thinking_llm
-            )
-            delete_nodes["hot_money"] = create_msg_delete()
-            tool_nodes["hot_money"] = self.tool_nodes["hot_money"]
-
-        if "lockup" in selected_analysts:
-            analyst_nodes["lockup"] = create_lockup_watcher(
-                self.quick_thinking_llm
-            )
-            delete_nodes["lockup"] = create_msg_delete()
-            tool_nodes["lockup"] = self.tool_nodes["lockup"]
+        # ── Parallel Analysts: replaces sequential + Send fan-out ──
+        # All 7 analysts run concurrently via ThreadPoolExecutor inside a single
+        # LangGraph node. Each analyst gets its own LLM, tools, and isolated
+        # message list — no cross-branch state contamination.
+        parallel_analyst_node = create_parallel_analyst_node(
+            llm=self.quick_thinking_llm,
+            tool_nodes=self.tool_nodes,
+            selected_analysts=selected_analysts,
+        )
 
         # Create quality gate node
         quality_gate_node = create_quality_gate(self.quick_thinking_llm)
 
         # Create researcher and manager nodes
+        # Speed optimisation: use quick_think for all nodes.
+        # The 7 analysts already produce high-quality reports; deep_think on
+        # synthesis nodes adds ~15-25s with marginal gain on flash-tier models.
+        synthesis_llm = self.quick_thinking_llm
+
+        # Create individual debate + risk nodes (wrapped in parallel executors)
         bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
         bear_researcher_node = create_bear_researcher(self.quick_thinking_llm)
-        research_manager_node = create_research_manager(self.deep_thinking_llm)
+        parallel_debate_node = create_parallel_debate_node(
+            bull_researcher_node, bear_researcher_node,
+        )
+
+        research_manager_node = create_research_manager(synthesis_llm)
         trader_node = create_trader(self.quick_thinking_llm)
 
-        # Create risk analysis nodes
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
-        neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
+        neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
+        parallel_risk_node = create_parallel_risk_node(
+            aggressive_analyst, conservative_analyst, neutral_analyst,
+        )
+
+        portfolio_manager_node = create_portfolio_manager(synthesis_llm)
 
         # Create workflow
         workflow = StateGraph(AgentState)
 
-        # Add analyst nodes to the graph
-        for analyst_type, node in analyst_nodes.items():
-            workflow.add_node(f"{analyst_type.capitalize()} Analyst", node)
-            workflow.add_node(
-                f"Msg Clear {analyst_type.capitalize()}", delete_nodes[analyst_type]
-            )
-            workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
-
-        # Add quality gate + other nodes
+        # Add nodes: all parallelism is INSIDE the nodes
+        workflow.add_node("Parallel Analysts", parallel_analyst_node)
         workflow.add_node("Quality Gate", quality_gate_node)
-        workflow.add_node("Bull Researcher", bull_researcher_node)
-        workflow.add_node("Bear Researcher", bear_researcher_node)
+        workflow.add_node("Parallel Debate", parallel_debate_node)
         workflow.add_node("Research Manager", research_manager_node)
         workflow.add_node("Trader", trader_node)
-        workflow.add_node("Aggressive Analyst", aggressive_analyst)
-        workflow.add_node("Neutral Analyst", neutral_analyst)
-        workflow.add_node("Conservative Analyst", conservative_analyst)
+        workflow.add_node("Parallel Risk", parallel_risk_node)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
 
-        # Define edges
-        # Start with the first analyst
-        first_analyst = selected_analysts[0]
-        workflow.add_edge(START, f"{first_analyst.capitalize()} Analyst")
-
-        # Connect analysts in sequence
-        for i, analyst_type in enumerate(selected_analysts):
-            current_analyst = f"{analyst_type.capitalize()} Analyst"
-            current_tools = f"tools_{analyst_type}"
-            current_clear = f"Msg Clear {analyst_type.capitalize()}"
-
-            # Add conditional edges for current analyst
-            workflow.add_conditional_edges(
-                current_analyst,
-                getattr(self.conditional_logic, f"should_continue_{analyst_type}"),
-                [current_tools, current_clear],
-            )
-            workflow.add_edge(current_tools, current_analyst)
-
-            # Connect to next analyst or to Bull Researcher if this is the last analyst
-            if i < len(selected_analysts) - 1:
-                next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
-                workflow.add_edge(current_clear, next_analyst)
-            else:
-                workflow.add_edge(current_clear, "Quality Gate")
-
-        workflow.add_edge("Quality Gate", "Bull Researcher")
-
-        # Add remaining edges
-        workflow.add_conditional_edges(
-            "Bull Researcher",
-            self.conditional_logic.should_continue_debate,
-            {
-                "Bear Researcher": "Bear Researcher",
-                "Research Manager": "Research Manager",
-            },
-        )
-        workflow.add_conditional_edges(
-            "Bear Researcher",
-            self.conditional_logic.should_continue_debate,
-            {
-                "Bull Researcher": "Bull Researcher",
-                "Research Manager": "Research Manager",
-            },
-        )
+        # ── Fully linear graph (all parallelism internal to nodes) ──
+        workflow.add_edge(START, "Parallel Analysts")
+        workflow.add_edge("Parallel Analysts", "Quality Gate")
+        workflow.add_edge("Quality Gate", "Parallel Debate")
+        workflow.add_edge("Parallel Debate", "Research Manager")
         workflow.add_edge("Research Manager", "Trader")
-        workflow.add_edge("Trader", "Aggressive Analyst")
-        workflow.add_conditional_edges(
-            "Aggressive Analyst",
-            self.conditional_logic.should_continue_risk_analysis,
-            {
-                "Conservative Analyst": "Conservative Analyst",
-                "Portfolio Manager": "Portfolio Manager",
-            },
-        )
-        workflow.add_conditional_edges(
-            "Conservative Analyst",
-            self.conditional_logic.should_continue_risk_analysis,
-            {
-                "Neutral Analyst": "Neutral Analyst",
-                "Portfolio Manager": "Portfolio Manager",
-            },
-        )
-        workflow.add_conditional_edges(
-            "Neutral Analyst",
-            self.conditional_logic.should_continue_risk_analysis,
-            {
-                "Aggressive Analyst": "Aggressive Analyst",
-                "Portfolio Manager": "Portfolio Manager",
-            },
-        )
-
+        workflow.add_edge("Trader", "Parallel Risk")
+        workflow.add_edge("Parallel Risk", "Portfolio Manager")
         workflow.add_edge("Portfolio Manager", END)
 
         return workflow
